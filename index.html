@@ -1,0 +1,594 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Family Tree Builder – Vanilla JS</title>
+  <style>
+    :root{
+      --dot: #c8c8c8;
+      --bg: #fff;
+      --accent: #2563eb;
+      --accent-2: #10b981;
+      --text: #111;
+    }
+    *{ box-sizing: border-box; }
+    html,body{ height:100%; margin:0; }
+    body{
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+      color: var(--text);
+      background: var(--bg);
+      overflow: hidden; /* we handle panning */
+    }
+
+    /* Toolbar */
+    .toolbar{
+      position: fixed; inset: 12px auto auto 12px; z-index: 1000;
+      display:flex; gap:8px; flex-wrap:wrap; align-items:center;
+      padding:10px; border-radius:14px; background:#ffffffcc; backdrop-filter: blur(6px);
+      box-shadow: 0 10px 30px rgba(0,0,0,.12);
+    }
+    .toolbar button, .toolbar input[type="file"]::file-selector-button{
+      border:1px solid #e5e7eb; background:#fff; padding:8px 12px; border-radius:10px; cursor:pointer;
+      transition:.15s transform ease, .15s background ease, .15s border-color ease;
+      font-weight:600;
+    }
+    .toolbar button:hover{ transform: translateY(-1px); background:#f8fafc; }
+    .toolbar button.primary{ border-color: var(--accent); color:#fff; background: var(--accent); }
+    .toolbar button.success{ border-color: var(--accent-2); color:#fff; background: var(--accent-2); }
+    .toolbar .sep{ width:1px; height:28px; background:#e5e7eb; margin:0 4px; }
+    .toolbar label{ font-size:12px; opacity:.8; }
+    .zoom-indicator{ font-size:12px; opacity:.75; }
+
+    /* Canvas container */
+    .canvas-wrap{
+      position:fixed; inset:0; overflow:hidden; cursor: grab; background:#fff;
+    }
+    .canvas-wrap:active{ cursor: grabbing; }
+
+    /* Infinite dot grid canvas */
+    .grid-canvas{ position:absolute; inset:0; z-index:0; pointer-events:none; }
+
+    /* World/Viewport that we transform for pan/zoom */
+    .world{
+      position:absolute; inset:0; transform-origin: 0 0; z-index:1; /* transformed via JS */
+      /* background removed – dots are drawn on canvas so they don't scale/snaps */
+    }
+
+    /* Edges layer */
+    svg.edges{ position:absolute; inset:0; overflow:visible; pointer-events:none; }
+    .edge{ stroke:#111; stroke-opacity:.55; stroke-width:2; }
+
+    /* Person node */
+    .node{
+      position:absolute; min-width: 160px; max-width: 280px;
+      background:#fff; border: 2px solid #e5e7eb; border-radius:12px; padding:10px 12px; box-shadow: 0 6px 20px rgba(0,0,0,.08);
+      user-select: none;
+      transform: translate(-50%, -50%); /* position by center */
+    }
+    .node .name{ font-size:16px; font-weight:700; outline:none; }
+    .node .meta{ font-size:12px; opacity:.7; margin-top:4px; outline:none; }
+    .node .badge{ display:inline-flex; align-items:center; gap:6px; font-size:12px; background:#f8fafc; border:1px solid #e5e7eb; border-radius:999px; padding:4px 8px; margin-top:6px; }
+    .node.selected{ border-color: var(--accent); box-shadow: 0 6px 24px rgba(37,99,235,.25); }
+
+    .hint{
+      position:fixed; left:12px; bottom:12px; z-index:1000; font-size:12px; opacity:.75; background:#ffffffcc; padding:8px 12px; border-radius:10px; box-shadow: 0 6px 20px rgba(0,0,0,.08);
+    }
+
+    /* Selection marquee */
+    .marquee{ position:absolute; border:2px dashed #2563eb; background: rgba(37,99,235,.08); pointer-events:none; }
+
+    /* Mini-map */
+    .minimap{
+      position: fixed; right: 12px; bottom: 12px; width: 180px; height: 120px; background: #fafafa; border:1px solid #e5e7eb; border-radius:10px; overflow:hidden; box-shadow: 0 10px 30px rgba(0,0,0,.12); z-index: 900; cursor: crosshair;
+    }
+    .minimap svg{ width:100%; height:100%; display:block; }
+  </style>
+</head>
+<body>
+  <div class="toolbar" id="toolbar">
+    <button id="addNode" class="primary">Add Person</button>
+    <button id="connectAll" class="success" title="Connect all selected to each other">Connect Selected</button>
+    <button id="connectHub" title="Use first selected as hub">Connect via Hub</button>
+    <button id="deleteSelected" title="Delete selected nodes">Delete Selected</button>
+    <div class="sep"></div>
+    <button id="zoomIn">＋</button>
+    <button id="zoomOut">－</button>
+    <button id="resetView" title="Reset pan & zoom">Reset View</button>
+    <span class="zoom-indicator" id="zoomPct">100%</span>
+    <div class="sep"></div>
+    <button id="save">Save</button>
+    <button id="load">Load</button>
+    <label><input type="checkbox" id="snap" checked /> Snap to grid</label>
+  </div>
+
+  <div class="canvas-wrap" id="canvas">
+    <canvas id="gridCanvas" class="grid-canvas"></canvas>
+    <div class="world" id="world">
+      <svg class="edges" id="edges"></svg>
+      <!-- nodes injected here -->
+      <div class="marquee" id="marquee" hidden></div>
+    </div>
+  </div>
+
+  <div class="hint">
+    Tip: Click to select. Shift+Click for multi-select. Drag nodes to move. Mouse wheel to zoom. Drag empty space to pan. Shift+Drag empty space to box-select.
+  </div>
+
+  <div class="minimap" id="minimap" aria-label="Mini map (click to jump, drag to pan)"></div>
+
+  <script>
+    /*** State ***/
+    const state = {
+      nodes: new Map(), // id -> {id, x, y, name, meta, z}
+      edges: [],        // [{a, b}]
+      selection: new Set(),
+      scale: 1,
+      panX: 0,
+      panY: 0,
+      nextId: 1,
+      grid: 24,
+      zCounter: 1,
+      minimap: null,   // {k, ox, oy, minX, minY, maxX, maxY, vw, vh}
+    };
+
+    // Smooth view animation targets
+    let targetScale = state.scale,
+        targetPanX = state.panX,
+        targetPanY = state.panY,
+        rafId = null;
+
+    const canvas = document.getElementById('canvas');
+    const world  = document.getElementById('world');
+    const edgeSvg= document.getElementById('edges');
+    const marquee= document.getElementById('marquee');
+    const zoomPct= document.getElementById('zoomPct');
+    const gridCanvas = document.getElementById('gridCanvas');
+    const gridCtx = gridCanvas.getContext('2d');
+
+    /*** Helpers ***/
+    const uid = () => String(state.nextId++);
+
+    function toWorldPoint(clientX, clientY){
+      const rect = world.getBoundingClientRect();
+      const x = (clientX - rect.left - state.panX) / state.scale;
+      const y = (clientY - rect.top  - state.panY) / state.scale;
+      return {x, y};
+    }
+
+    function render(){
+      world.style.transform = `translate(${state.panX}px, ${state.panY}px) scale(${state.scale})`;
+      zoomPct.textContent = Math.round(state.scale*100) + '%';
+      drawDots();
+      // Render nodes
+      for(const [id, n] of state.nodes){
+        let el = document.getElementById('node-'+id);
+        if(!el){ el = createNodeEl(n); world.appendChild(el); }
+        el.style.left = n.x + 'px';
+        el.style.top  = n.y + 'px';
+        el.style.zIndex = n.z || 1;
+        el.classList.toggle('selected', state.selection.has(id));
+        el.querySelector('.name').textContent = n.name;
+        el.querySelector('.meta').textContent = n.meta || '';
+      }
+      // Remove orphan DOM nodes
+      for(const el of Array.from(world.querySelectorAll('.node'))){
+        const id = el.dataset.id; if(!state.nodes.has(id)) el.remove();
+      }
+      renderEdges();
+      renderMiniMap();
+      saveDraft(); // continuous autosave keeps state safe
+    }
+
+    function renderEdges(){
+      edgeSvg.innerHTML = '';
+      for(const e of state.edges){
+        const a = state.nodes.get(e.a); const b = state.nodes.get(e.b);
+        if(!a || !b) continue;
+        const line = document.createElementNS('http://www.w3.org/2000/svg','line');
+        line.setAttribute('x1', a.x);
+        line.setAttribute('y1', a.y);
+        line.setAttribute('x2', b.x);
+        line.setAttribute('y2', b.y);
+        line.setAttribute('class','edge');
+        line.setAttribute('stroke-dasharray', e.dash ? '4 6' : '');
+        edgeSvg.appendChild(line);
+      }
+    }
+
+    function createNodeEl(n){
+      const el = document.createElement('div');
+      el.className = 'node';
+      el.dataset.id = n.id;
+      el.id = 'node-'+n.id;
+      el.innerHTML = `
+        <div class="name" contenteditable spellcheck="false"></div>
+        <div class="meta" contenteditable spellcheck="false"></div>
+        <div class="badge">ID: ${n.id}</div>
+      `;
+      el.querySelector('.name').textContent = n.name;
+      el.querySelector('.meta').textContent = n.meta || '';
+
+      // Click/Select: single click selects just this; Shift toggles for multi-select
+      el.addEventListener('pointerdown', (e)=>{
+        e.stopPropagation();
+        const id = n.id;
+        if(e.shiftKey){
+          if(state.selection.has(id)) state.selection.delete(id); else state.selection.add(id);
+        }else{
+          if(!state.selection.has(id)) { state.selection.clear(); state.selection.add(id); }
+        }
+        bringToFront(id);
+        dragNodeStart(e, n.id);
+        render();
+      });
+
+      // Update name/meta on input
+      el.querySelector('.name').addEventListener('input', (e)=>{ n.name = e.currentTarget.textContent.trim(); });
+      el.querySelector('.meta').addEventListener('input', (e)=>{ n.meta = e.currentTarget.textContent.trim(); });
+
+      return el;
+    }
+
+    function bringToFront(id){ const n = state.nodes.get(id); n.z = ++state.zCounter; }
+
+    /*** Node dragging ***/
+    let dragging = null; // {id, ox, oy}
+    function dragNodeStart(e, id){
+      const n = state.nodes.get(id);
+      const {x: wx, y: wy} = toWorldPoint(e.clientX, e.clientY);
+      dragging = { id, ox: wx - n.x, oy: wy - n.y };
+      window.addEventListener('pointermove', dragNodeMove);
+      window.addEventListener('pointerup', dragNodeEnd, { once:true });
+    }
+    function dragNodeMove(e){
+      if(!dragging) return;
+      const {x, y} = toWorldPoint(e.clientX, e.clientY);
+      let nx = x - dragging.ox; let ny = y - dragging.oy;
+      if(document.getElementById('snap').checked){
+        nx = Math.round(nx / state.grid) * state.grid;
+        ny = Math.round(ny / state.grid) * state.grid;
+      }
+      const n = state.nodes.get(dragging.id);
+      n.x = nx; n.y = ny;
+      render();
+    }
+    function dragNodeEnd(){ dragging = null; window.removeEventListener('pointermove', dragNodeMove); }
+
+    /*** Pan, Zoom, and Marquee ***/
+    let panning = false; let panStart = {x:0,y:0, panX:0, panY:0};
+    let boxSelecting = false; let boxStart = {x:0,y:0};
+
+    canvas.addEventListener('pointerdown', (e)=>{
+      const isShift = e.shiftKey;
+      const {x,y} = toWorldPoint(e.clientX, e.clientY);
+      if(isShift){
+        // start marquee selection
+        boxSelecting = true; boxStart = {x,y};
+        marquee.hidden = false; updateMarquee(x,y);
+      }else{
+        // pan
+        state.selection.clear();
+        panning = true; const {clientX:cx, clientY:cy} = e; panStart = {x:cx,y:cy, panX: state.panX, panY: state.panY};
+      }
+      render();
+      window.addEventListener('pointerup', ()=>{ panning=false; if(boxSelecting){ boxSelecting=false; marquee.hidden=true; } }, {once:true});
+    });
+
+    canvas.addEventListener('pointermove', (e)=>{
+      if(panning){ state.panX = panStart.panX + (e.clientX - panStart.x); state.panY = panStart.panY + (e.clientY - panStart.y); targetPanX = state.panX; targetPanY = state.panY; render(); return; }
+      if(boxSelecting){
+        const {x,y} = toWorldPoint(e.clientX, e.clientY);
+        updateMarquee(x,y);
+        // select nodes inside the marquee
+        const rect = currentMarqueeRect();
+        state.selection.clear();
+        for(const [id,n] of state.nodes){ if(pointInRect(n.x, n.y, rect)) state.selection.add(id); }
+        render();
+      }
+    });
+
+    function updateMarquee(x,y){
+      const x0 = Math.min(boxStart.x, x), y0 = Math.min(boxStart.y, y);
+      const w  = Math.abs(x - boxStart.x), h = Math.abs(y - boxStart.y);
+      marquee.style.left = x0 + 'px'; marquee.style.top = y0 + 'px'; marquee.style.width = w + 'px'; marquee.style.height = h + 'px';
+    }
+    function currentMarqueeRect(){
+      const x = parseFloat(marquee.style.left)||0, y=parseFloat(marquee.style.top)||0, w=parseFloat(marquee.style.width)||0, h=parseFloat(marquee.style.height)||0;
+      return {x, y, w, h};
+    }
+    function pointInRect(px,py, r){ return px>=r.x && py>=r.y && px<=r.x+r.w && py<=r.y+r.h; }
+
+    // Smooth zoom (very slow + eased)
+    const ZOOM_MIN = 0.02, ZOOM_MAX = 10;
+
+    function setTargetView(newScale, newPanX, newPanY){
+      targetScale = clamp(newScale, ZOOM_MIN, ZOOM_MAX);
+      targetPanX = newPanX; targetPanY = newPanY;
+      if(!rafId) rafId = requestAnimationFrame(tickView);
+    }
+
+    function tickView(){
+      const ease = 0.2; // smoothing factor per frame
+      const ds = targetScale - state.scale;
+      const dpx = targetPanX - state.panX;
+      const dpy = targetPanY - state.panY;
+      if (Math.abs(ds)+Math.abs(dpx)+Math.abs(dpy) < 0.001){
+        state.scale = targetScale; state.panX = targetPanX; state.panY = targetPanY;
+        render();
+        rafId = null; return;
+      }
+      state.scale += ds * ease;
+      state.panX  += dpx * ease;
+      state.panY  += dpy * ease;
+      render();
+      rafId = requestAnimationFrame(tickView);
+    }
+
+    canvas.addEventListener('wheel', (e)=>{
+      e.preventDefault();
+      const delta = -e.deltaY; // natural: wheel up zoom in
+      const factor = Math.exp(delta * 0.00012); // WAY slower than before
+      const {x, y} = toWorldPoint(e.clientX, e.clientY);
+      const newScale = clamp(state.scale * factor, ZOOM_MIN, ZOOM_MAX);
+      const newPanX = e.clientX - (x * newScale);
+      const newPanY = e.clientY - (y * newScale);
+      setTargetView(newScale, newPanX, newPanY);
+    }, { passive:false });
+
+    document.getElementById('zoomIn').onclick = ()=>{ zoomAtCenter(1.02); };   // tiny step
+    document.getElementById('zoomOut').onclick= ()=>{ zoomAtCenter(1/1.02); };
+    document.getElementById('resetView').onclick= ()=>{ setTargetView(1, 0, 0); };
+
+    function zoomAtCenter(factor){
+      const rect = canvas.getBoundingClientRect();
+      const cx = rect.left + rect.width/2; const cy = rect.top + rect.height/2;
+      const {x,y} = toWorldPoint(cx, cy);
+      const newScale = clamp(state.scale * factor, ZOOM_MIN, ZOOM_MAX);
+      setTargetView(newScale, cx - (x * newScale), cy - (y * newScale));
+    }
+
+    const clamp = (v,min,max)=> Math.max(min, Math.min(max, v));
+
+    /*** Commands ***/
+    document.getElementById('addNode').onclick = ()=>{
+      const center = toWorldPoint(innerWidth/2, innerHeight/2);
+      const id = uid();
+      state.nodes.set(id, { id, x: Math.round(center.x/state.grid)*state.grid, y: Math.round(center.y/state.grid)*state.grid, name: 'Person '+id, meta: '', z: ++state.zCounter });
+      state.selection.clear(); state.selection.add(id);
+      render();
+    };
+
+    function connectSelectedAllToAll(){
+      const ids = Array.from(state.selection);
+      if(ids.length < 2) { flash('Select 2+ people first (Shift+Click or box-select).'); return; }
+      for(let i=0;i<ids.length;i++){
+        for(let j=i+1;j<ids.length;j++) addEdge(ids[i], ids[j]);
+      }
+      render();
+      flash('Connected '+ids.length+' selected.');
+    }
+
+    function connectSelectedViaHub(){
+      const ids = Array.from(state.selection);
+      if(ids.length < 2) { flash('Select 2+ people first.'); return; }
+      const hub = ids[0];
+      for(let i=1;i<ids.length;i++) addEdge(hub, ids[i], true);
+      render();
+      flash('Connected via hub ' + hub);
+    }
+
+    function addEdge(a,b, dashed=false){
+      if(a===b) return;
+      if(state.edges.some(e=> (e.a===a && e.b===b) || (e.a===b && e.b===a))) return; // prevent duplicates
+      state.edges.push({a,b, dash: dashed});
+    }
+
+    document.getElementById('connectAll').onclick = connectSelectedAllToAll;
+    document.getElementById('connectHub').onclick = connectSelectedViaHub;
+
+    document.getElementById('deleteSelected').onclick = ()=>{
+      const ids = new Set(state.selection);
+      if(ids.size===0) { flash('Nothing selected.'); return; }
+      // remove nodes
+      for(const id of ids){ state.nodes.delete(id); }
+      // remove edges touching removed nodes
+      state.edges = state.edges.filter(e=> !ids.has(e.a) && !ids.has(e.b));
+      state.selection.clear();
+      render();
+      flash('Deleted.');
+    };
+
+    // Save / Load to localStorage
+    document.getElementById('save').onclick = ()=>{
+      const data = JSON.stringify(serialize());
+      localStorage.setItem('familyTreeDraft', data);
+      flash('Saved.');
+    };
+    document.getElementById('load').onclick = ()=>{
+      const raw = localStorage.getItem('familyTreeDraft');
+      if(!raw) return flash('No saved data.');
+      try{ hydrate(JSON.parse(raw)); render(); flash('Loaded.'); }
+      catch(err){ console.error(err); flash('Failed to load.'); }
+    };
+
+    function serialize(){
+      return {
+        nodes: Array.from(state.nodes.values()),
+        edges: state.edges,
+        nextId: state.nextId,
+        view: { panX: state.panX, panY: state.panY, scale: state.scale },
+        zCounter: state.zCounter,
+      };
+    }
+    function hydrate(data){
+      state.nodes = new Map((data.nodes||[]).map(n=>[n.id, n]));
+      state.edges = data.edges || [];
+      state.nextId = data.nextId || 1;
+      state.zCounter = data.zCounter || 1;
+      if(data.view){ state.panX=data.view.panX||0; state.panY=data.view.panY||0; state.scale=data.view.scale||1; targetPanX=state.panX; targetPanY=state.panY; targetScale=state.scale; }
+    }
+
+    function saveDraft(){
+      localStorage.setItem('familyTreeDraft', JSON.stringify(serialize()));
+    }
+
+    function flash(msg){
+      const el = document.createElement('div');
+      el.textContent = msg; el.style.position='fixed'; el.style.left='50%'; el.style.top='12px'; el.style.transform='translateX(-50%)'; el.style.background='#111'; el.style.color='#fff'; el.style.padding='8px 12px'; el.style.borderRadius='10px'; el.style.zIndex=2000; el.style.opacity='0.95';
+      document.body.appendChild(el);
+      setTimeout(()=>{ el.remove(); }, 1200);
+    }
+
+    /*** Infinite dot grid drawing (two interleaved grids) ***/
+    function resizeGridCanvas(){
+      const dpr = window.devicePixelRatio || 1;
+      gridCanvas.width = Math.floor(gridCanvas.clientWidth * dpr);
+      gridCanvas.height = Math.floor(gridCanvas.clientHeight * dpr);
+      gridCtx.setTransform(dpr,0,0,dpr,0,0);
+    }
+
+    function drawDots(){
+      if(gridCanvas.width === 0 || gridCanvas.height === 0) resizeGridCanvas();
+      const w = gridCanvas.clientWidth, h = gridCanvas.clientHeight;
+      gridCtx.clearRect(0,0,w,h);
+      const style = getComputedStyle(document.documentElement);
+      const dotColor = style.getPropertyValue('--dot').trim() || '#c8c8c8';
+      gridCtx.fillStyle = dotColor;
+      const spacing = state.grid * state.scale; // world grid scaled into screen space
+      if(spacing < 4) return; // avoid overdraw when far out; dots would be solid anyway
+      const r = 1; // constant screen-size dots
+
+      // primary lattice offset by pan to keep dots anchored to world
+      const offX = mod(state.panX, spacing);
+      const offY = mod(state.panY, spacing);
+      for(let x = -offX; x <= w; x += spacing){
+        for(let y = -offY; y <= h; y += spacing){
+          gridCtx.fillRect(Math.round(x), Math.round(y), r, r);
+        }
+      }
+      // secondary lattice (checker offset)
+      const offX2 = mod(state.panX + 0.5*state.grid*state.scale, spacing);
+      const offY2 = mod(state.panY + 0.5*state.grid*state.scale, spacing);
+      for(let x = -offX2; x <= w; x += spacing){
+        for(let y = -offY2; y <= h; y += spacing){
+          gridCtx.fillRect(Math.round(x), Math.round(y), r, r);
+        }
+      }
+    }
+
+    function mod(a,b){ return ((a % b) + b) % b; }
+    window.addEventListener('resize', ()=>{ resizeGridCanvas(); render(); });
+    resizeGridCanvas();
+
+    /*** Mini-map (click/drag to move view + view rectangle) ***/
+    const minimapEl = document.getElementById('minimap');
+    let minimapDragging = false;
+
+    function renderMiniMap(){
+      const pad = 2000; // world bounds consider nodes + padding
+      const nodes = Array.from(state.nodes.values());
+      const xs = nodes.map(n=>n.x), ys = nodes.map(n=>n.y);
+      const minX = Math.min(-pad, ...xs, 0-pad);
+      const minY = Math.min(-pad, ...ys, 0-pad);
+      const maxX = Math.max(pad, ...xs, innerWidth+pad);
+      const maxY = Math.max(pad, ...ys, innerHeight+pad);
+      const w = maxX - minX, h = maxY - minY;
+      const vw = minimapEl.clientWidth, vh = minimapEl.clientHeight;
+      const sx = vw / w, sy = vh / h;
+      const k = Math.min(sx, sy);
+      const ox = -minX * k, oy = -minY * k;
+
+      // cache transform for interaction
+      state.minimap = {k, ox, oy, minX, minY, maxX, maxY, vw, vh};
+
+      // viewport in world coords
+      const v0 = toWorldPoint(0, 0);
+      const v1 = toWorldPoint(innerWidth, innerHeight);
+      const vx = Math.min(v0.x, v1.x), vy = Math.min(v0.y, v1.y);
+      const vwWorld = Math.abs(v1.x - v0.x), vhWorld = Math.abs(v1.y - v0.y);
+
+      let svg = `<svg viewBox="0 0 ${vw} ${vh}" xmlns="http://www.w3.org/2000/svg">`;
+      // edges
+      for(const e of state.edges){
+        const a = state.nodes.get(e.a); const b = state.nodes.get(e.b); if(!a||!b) continue;
+        svg += `<line x1="${a.x*k+ox}" y1="${a.y*k+oy}" x2="${b.x*k+ox}" y2="${b.y*k+oy}" stroke="#999" stroke-width="1"/>`;
+      }
+      // nodes
+      for(const n of state.nodes.values()){
+        svg += `<circle cx="${n.x*k+ox}" cy="${n.y*k+oy}" r="3" fill="${state.selection.has(n.id)?'#2563eb':'#111'}"/>`;
+      }
+      // viewport rectangle
+      const rx = vx*k + ox, ry = vy*k + oy, rw = vwWorld*k, rh = vhWorld*k;
+      svg += `<rect x="${rx}" y="${ry}" width="${rw}" height="${rh}" fill="rgba(37,99,235,0.1)" stroke="#2563eb" stroke-width="2"/>`;
+      svg += `</svg>`;
+      minimapEl.innerHTML = svg;
+    }
+
+    function minimapJumpTo(clientX, clientY){
+      if(!state.minimap) return;
+      const {k, ox, oy} = state.minimap;
+      const rect = minimapEl.getBoundingClientRect();
+      const mx = clientX - rect.left;
+      const my = clientY - rect.top;
+      const wx = (mx - ox) / k;
+      const wy = (my - oy) / k;
+
+      // center the main view on (wx, wy) smoothly
+      const cx = innerWidth/2, cy = innerHeight/2;
+      const newPanX = cx - wx * state.scale;
+      const newPanY = cy - wy * state.scale;
+      setTargetView(state.scale, newPanX, newPanY);
+    }
+
+    minimapEl.addEventListener('pointerdown', (e)=>{
+      minimapDragging = true; minimapEl.setPointerCapture(e.pointerId);
+      minimapJumpTo(e.clientX, e.clientY);
+    });
+    minimapEl.addEventListener('pointermove', (e)=>{
+      if(!minimapDragging) return; minimapJumpTo(e.clientX, e.clientY);
+    });
+    minimapEl.addEventListener('pointerup', (e)=>{
+      minimapDragging = false; minimapEl.releasePointerCapture(e.pointerId);
+    });
+
+    /*** Keyboard shortcuts ***/
+    window.addEventListener('keydown', (e)=>{
+      if(e.key === 'Delete' || e.key === 'Backspace'){
+        if(document.activeElement && ['INPUT','TEXTAREA'].includes(document.activeElement.tagName)) return;
+        document.getElementById('deleteSelected').click();
+      }
+      if(e.key === 'a' && (e.ctrlKey||e.metaKey)){
+        e.preventDefault(); state.selection = new Set([...state.nodes.keys()]); render();
+      }
+      if(e.key === 'c' && (e.ctrlKey||e.metaKey)){
+        e.preventDefault(); connectSelectedAllToAll();
+      }
+      if(e.key === 'h' && (e.ctrlKey||e.metaKey)){
+        e.preventDefault(); connectSelectedViaHub();
+      }
+      if(e.key === '+'){ zoomAtCenter(1.02); }
+      if(e.key === '-') { zoomAtCenter(1/1.02); }
+      if(e.key === '0' && (e.ctrlKey||e.metaKey)) { setTargetView(1,0,0); }
+      if(e.key === 'Enter' && (e.ctrlKey||e.metaKey)) { connectSelectedAllToAll(); }
+    });
+
+    /*** Boot ***/
+    (function init(){
+      resizeGridCanvas();
+      const raw = localStorage.getItem('familyTreeDraft');
+      if(raw){ try{ hydrate(JSON.parse(raw)); }catch(_){}}
+      // Seed with a few nodes if empty
+      if(state.nodes.size===0){
+        const a = uid(), b = uid(), c = uid();
+        state.nodes.set(a,{id:a, x:0,   y:0,   name:'Alex', meta:'(you can edit)', z: ++state.zCounter});
+        state.nodes.set(b,{id:b, x:240, y:0,   name:'Blair', z: ++state.zCounter});
+        state.nodes.set(c,{id:c, x:120, y:160, name:'Casey', z: ++state.zCounter});
+        state.edges.push({a,b}, {a,c});
+        state.selection.add(a);
+      }
+      render();
+    })();
+  </script>
+</body>
+</html>
